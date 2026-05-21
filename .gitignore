@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+
+# Runtime artifacts the notebook writes into the working tree
+source/*
+!source/.gitkeep
+danbooru.db
+*.gguf
+caption.log

@@ -1,0 +1,12 @@
+# Caption pipeline (CPU / GPU agnostic)
+Pillow
+tqdm
+
+# Tag-lookup query stack (inlined from danbooru-db)
+sqlite-vec>=0.1.6
+huggingface-hub>=0.26
+numpy>=2.0
+
+# llama-cpp-python is installed separately in the notebook from a JamePeng-fork
+# prebuilt CUDA wheel — the fork ships a Gemma4ChatHandler the upstream package
+# does not yet expose.
