@@ -83,7 +83,7 @@ class _ArgParser:
 
     def _value(self) -> Any:
         self._ws()
-        if self._peek(len(_STR_DELIM)) == _STR_DELIM:
+        if self._peek(len(_STR_DELIM)) == _STR_DELIM or self._peek() == '"':
             return self._string()
         head = self._peek()
         if head == "[":
@@ -93,14 +93,32 @@ class _ArgParser:
         return self._bare()
 
     def _string(self) -> str:
-        if not self._try(_STR_DELIM):
-            raise ValueError(f"expected string at pos {self.pos}")
-        end = self.src.find(_STR_DELIM, self.pos)
-        if end < 0:
-            raise ValueError(f"unterminated string at pos {self.pos}")
-        value = self.src[self.pos : end]
-        self.pos = end + len(_STR_DELIM)
-        return value
+        # Gemma-native form: <|"|>...<|"|>
+        if self._try(_STR_DELIM):
+            end = self.src.find(_STR_DELIM, self.pos)
+            if end < 0:
+                raise ValueError(f"unterminated <|\"|>-string at pos {self.pos}")
+            value = self.src[self.pos : end]
+            self.pos = end + len(_STR_DELIM)
+            return value
+        # JSON fallback: "..." with backslash escapes (the model sometimes
+        # emits this when it gets confused — accept it rather than dying).
+        if self._try('"'):
+            escapes = {"n": "\n", "t": "\t", "r": "\r", '"': '"', "\\": "\\", "/": "/"}
+            out: list[str] = []
+            while self.pos < len(self.src):
+                ch = self.src[self.pos]
+                if ch == '"':
+                    self.pos += 1
+                    return "".join(out)
+                if ch == "\\" and self.pos + 1 < len(self.src):
+                    out.append(escapes.get(self.src[self.pos + 1], self.src[self.pos + 1]))
+                    self.pos += 2
+                    continue
+                out.append(ch)
+                self.pos += 1
+            raise ValueError(f"unterminated \"-string at pos {self.pos}")
+        raise ValueError(f"expected string at pos {self.pos}")
 
     def _array(self) -> list:
         if not self._try("["):
@@ -127,7 +145,7 @@ class _ArgParser:
             return out
         while True:
             self._ws()
-            if self._peek(len(_STR_DELIM)) == _STR_DELIM:
+            if self._peek(len(_STR_DELIM)) == _STR_DELIM or self._peek() == '"':
                 key = self._string()
             else:
                 start = self.pos
@@ -201,20 +219,28 @@ def parse_assistant_message(raw: str) -> dict:
     if tool_calls_raw:
         tool_calls = []
         for name, body in tool_calls_raw:
+            parse_error: str | None = None
             try:
                 args = _parse_tool_args(body)
             except Exception as exc:  # noqa: BLE001
-                args = {"_parse_error": str(exc), "_raw": body}
-            tool_calls.append(
-                {
-                    "id": f"call_{uuid.uuid4().hex[:8]}",
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "arguments": json.dumps(args),
-                    },
-                }
-            )
+                # Don't leak the malformed args back into the replay — that
+                # creates a feedback loop where the model sees its own garbage
+                # rerendered and tries even more variants. Replace with `{}`
+                # and surface the error on the tool_call itself; caption.py
+                # turns this into a format-hint tool response.
+                args = {}
+                parse_error = str(exc)
+            tc = {
+                "id": f"call_{uuid.uuid4().hex[:8]}",
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(args),
+                },
+            }
+            if parse_error is not None:
+                tc["_parse_error"] = parse_error
+            tool_calls.append(tc)
         msg["tool_calls"] = tool_calls
     msg["content"] = leftover if leftover else None
     return msg

@@ -17,7 +17,7 @@ from typing import Any
 import numpy as np
 import sqlite_vec
 from huggingface_hub import hf_hub_download
-from llama_cpp import Llama
+from llama_cpp.llama_embedding import LlamaEmbedding
 
 EMBED_DIM = 640
 
@@ -39,11 +39,14 @@ def _connect(db_path: str | Path) -> sqlite3.Connection:
     return conn
 
 
-def _load_query_model(n_gpu_layers: int = -1) -> Llama:
+def _load_query_model(n_gpu_layers: int = -1) -> LlamaEmbedding:
+    # JamePeng's fork deprecated `Llama.create_embedding` and the deprecated
+    # path is broken (calls `LlamaBatch.add_sequence` without the new
+    # `logits_array` arg). `LlamaEmbedding` is the supported replacement and
+    # auto-sets embeddings=True.
     path = hf_hub_download(QUERY_MODEL_REPO, QUERY_MODEL_FILE)
-    return Llama(
+    return LlamaEmbedding(
         model_path=path,
-        embedding=True,
         n_ctx=4096,
         pooling_type=3,  # LAST
         n_gpu_layers=n_gpu_layers,

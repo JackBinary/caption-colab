@@ -197,14 +197,55 @@ def _replay_assistant(msg: dict) -> dict:
     return {k: v for k, v in msg.items() if k != "reasoning_content"}
 
 
+# --------------------------------------------------------------------- verbose
+
+def _abbrev(s: str, n: int = 200) -> str:
+    s = " ".join(s.split())
+    return s if len(s) <= n else s[:n] + "…"
+
+
+def _fmt_arg(value: Any) -> str:
+    if isinstance(value, list):
+        if value and all(isinstance(v, str) for v in value):
+            sample = ", ".join(repr(v) for v in value[:3])
+            tail = f", +{len(value) - 3} more" if len(value) > 3 else ""
+            return f"[{len(value)}]({sample}{tail})"
+        return f"[{len(value)} items]"
+    if isinstance(value, str):
+        if len(value) > 60:
+            return f"{value[:60]!r}… ({len(value)} chars)"
+        return repr(value)
+    return repr(value)
+
+
+def _fmt_call(name: str, args: dict) -> str:
+    body = ", ".join(f"{k}={_fmt_arg(v)}" for k, v in args.items())
+    return f"{name}({body})"
+
+
+def _log(tag: str, line: str) -> None:
+    tqdm.write(f"[{tag}] {line}")
+
+
 def caption_image(image_path: Path, system_prompt: str, lookup: TagLookup,
-                  llm: Any) -> tuple[str, int]:
+                  llm: Any, *, verbose: bool = False) -> tuple[str, int]:
     messages = build_initial_messages(system_prompt, image_path)
     lookups = 0
+    tag = image_path.name
 
-    for _ in range(MAX_TOOL_ITERATIONS):
+    for iteration in range(1, MAX_TOOL_ITERATIONS + 1):
         msg = _chat(messages, llm)
         messages.append(_replay_assistant(msg))
+
+        if verbose:
+            reasoning = (msg.get("reasoning_content") or "").strip()
+            content = (msg.get("content") or "").strip()
+            if reasoning:
+                _log(tag, f"iter {iteration} thought ({len(reasoning)}B): {_abbrev(reasoning)}")
+            if content:
+                _log(tag, f"iter {iteration} content: {_abbrev(content)}")
+            if not reasoning and not content and not msg.get("tool_calls"):
+                _log(tag, f"iter {iteration} (empty response)")
 
         tool_calls = msg.get("tool_calls") or []
         if not tool_calls:
@@ -216,9 +257,33 @@ def caption_image(image_path: Path, system_prompt: str, lookup: TagLookup,
         submitted: str | None = None
         for tc in tool_calls:
             call_id, name, args = _normalize_tool_call(tc)
+            parse_error = tc.get("_parse_error") if isinstance(tc, dict) else None
+            if verbose:
+                if parse_error:
+                    _log(tag, f"iter {iteration} → {name}(<unparseable: {parse_error}>)")
+                else:
+                    _log(tag, f"iter {iteration} → {_fmt_call(name, args)}")
+            if parse_error:
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": json.dumps({
+                        "ok": False,
+                        "error": (
+                            f"Your previous {name} call could not be parsed. "
+                            "Retry using the standard tool-call format with valid arguments "
+                            "matching the tool's parameter schema."
+                        ),
+                    }),
+                })
+                if verbose:
+                    _log(tag, "  ↳ rejected (format hint sent)")
+                continue
             if name == "submit_caption":
                 candidate = (args.get("caption") or "").strip()
                 if lookups == 0:
+                    if verbose:
+                        _log(tag, "  ↳ submit_caption REJECTED (no lookups yet)")
                     messages.append({
                         "role": "tool",
                         "tool_call_id": call_id,
@@ -235,6 +300,8 @@ def caption_image(image_path: Path, system_prompt: str, lookup: TagLookup,
                     })
                     continue
                 if not candidate:
+                    if verbose:
+                        _log(tag, "  ↳ submit_caption REJECTED (empty caption)")
                     messages.append({
                         "role": "tool",
                         "tool_call_id": call_id,
@@ -248,6 +315,8 @@ def caption_image(image_path: Path, system_prompt: str, lookup: TagLookup,
                     })
                     continue
                 submitted = candidate
+                if verbose:
+                    _log(tag, f"  ↳ submit_caption OK ({len(candidate)} chars)")
                 messages.append({
                     "role": "tool",
                     "tool_call_id": call_id,
@@ -260,6 +329,7 @@ def caption_image(image_path: Path, system_prompt: str, lookup: TagLookup,
                     concepts = [concepts]
                 k = int(args.get("k", 5))
                 batch: list[dict] = []
+                errors_n = 0
                 for concept in concepts:
                     try:
                         results = lookup.lookup(concept, k)
@@ -267,8 +337,24 @@ def caption_image(image_path: Path, system_prompt: str, lookup: TagLookup,
                         lookups += 1
                     except Exception as e:  # noqa: BLE001
                         batch.append({"concept": concept, "error": str(e)})
+                        errors_n += 1
+                if verbose:
+                    matched = len(batch) - errors_n
+                    top = next((b for b in batch if b.get("matches")), None)
+                    first_err = next((b["error"] for b in batch if "error" in b), None)
+                    if top:
+                        names = [m.get("name", m) if isinstance(m, dict) else m
+                                 for m in top["matches"][:3]]
+                        suffix = f"  e.g. {top['concept']!r} → {names}"
+                    elif first_err:
+                        suffix = f"  first error: {first_err}"
+                    else:
+                        suffix = ""
+                    _log(tag, f"  ↳ lookup_tags: {matched}/{len(batch)} matched{suffix}")
                 content = json.dumps(batch)
             else:
+                if verbose:
+                    _log(tag, f"  ↳ unknown tool: {name}")
                 content = json.dumps({"error": f"unknown tool: {name}"})
             messages.append({
                 "role": "tool",
@@ -292,6 +378,7 @@ def caption_all(
     anima_md_path: str | Path,
     overwrite: bool = False,
     n_gpu_layers: int = -1,
+    verbose: bool = False,
 ) -> tuple[int, int]:
     """Caption every image in `source_dir` whose sidecar .txt is missing.
 
@@ -321,7 +408,9 @@ def caption_all(
     bar = tqdm(total=len(todo), unit="img", desc="caption")
     for path in todo:
         try:
-            prompt, lookups = caption_image(path, system_prompt, lookup, llm)
+            prompt, lookups = caption_image(
+                path, system_prompt, lookup, llm, verbose=verbose
+            )
             if not prompt:
                 raise RuntimeError("Empty response from VLM.")
             path.with_suffix(".txt").write_text(prompt + "\n")
