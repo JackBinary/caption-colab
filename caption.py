@@ -108,31 +108,52 @@ TOOL_DEFS = [
 ]
 
 
+TOOL_PROTOCOL_PROMPT = """You are a vision captioner. For every image you are shown, produce exactly one Anima-style prompt and submit it via the `submit_caption` tool.
+
+## Required tool-use protocol
+
+1. **Enumerate the image in natural language.** For each thing you intend to put in the caption — body type, hair (length, color, style, accessories), eyes, expression, each clothing piece with color and material, pose, action, props, background — write a short descriptive phrase the way a person would actually describe it out loud: `"long brown hair tied in a high ponytail with bangs"`, `"black hoodie with orange and purple stripes"`, `"abstract cyberpunk neon background with cyan and magenta lights"`. Do NOT pre-guess Danbooru tags here — describe what you see; the lookup step does the tag mapping.
+
+2. **Ground the concepts.** Call `lookup_tags` ONCE, passing that list of natural-language phrases as `concepts`. `lookup_tags` performs semantic search against the Danbooru tag wiki and returns the closest canonical tag names for each phrase. The index is general-category only — character names, artist names, and copyrights are not present, so it cannot leak them.
+
+3. **Write the caption** using the grounded wording. Where `lookup_tags` returned no close match (high distance, irrelevant names), describe that part in plain English; Anima accepts natural language for those slots.
+
+4. **Submit.** Call `submit_caption` exactly once with the final prompt as the `caption` argument.
+
+## Rules
+
+- `lookup_tags` is a **natural-language semantic search**, not a tag-to-tag lookup. Send rich descriptive phrases, not bare tags. `"red oil-paper umbrella"` is a good query; `"umbrella"` is too generic to ground well.
+- You MUST call `lookup_tags` at least once before calling `submit_caption`. `submit_caption` will be rejected until at least one batched lookup has happened.
+- Prefer one batched `lookup_tags` call over many sequential calls. List every concept in a single invocation; you can call again later if you spot something you missed.
+- Do not skip the protocol even if you already "know" the Danbooru wording — ground it.
+- Do not emit the caption as plain text. Submit it only through `submit_caption`.
+
+# Anima Style Guide
+
+"""
+
+
+def _strip_frontmatter(text: str) -> str:
+    """Strip a leading YAML frontmatter block (`--- ... ---`) if present."""
+    if not text.startswith("---\n"):
+        return text
+    end = text.find("\n---\n", 4)
+    if end < 0:
+        return text
+    return text[end + len("\n---\n") :].lstrip()
+
+
+def build_system_prompt(anima_md: str) -> str:
+    return TOOL_PROTOCOL_PROMPT + _strip_frontmatter(anima_md)
+
+
 def build_initial_messages(system_prompt: str, image_path: Path) -> list[dict]:
-    user_text = (
-        "Caption this image as an Anima prompt following the rules in the "
-        "system message.\n\n"
-        "First, look at the image and enumerate every distinct visual "
-        "concept you want to put in the prompt — hair, eyes, expression, "
-        "each clothing piece, pose, action, props, background. Then call "
-        "`lookup_tags` ONCE with that whole list to get the canonical "
-        "Danbooru wording in a single batched call. The index is "
-        "general-category only, so it cannot leak character or copyright "
-        "names; trust its results for vocabulary.\n\n"
-        "If a concept doesn't return a close match, that's fine — write "
-        "that part of the caption in plain English. Anima works better "
-        "with canonical tags but still accepts natural-language "
-        "description, so don't twist a description to fit a bad match.\n\n"
-        "When the caption is ready, call `submit_caption` with the final "
-        "Anima prompt as the `caption` argument. Do not write the prompt "
-        "as plain text — only submit it through the tool."
-    )
     return [
         {"role": "system", "content": system_prompt},
         {
             "role": "user",
             "content": [
-                {"type": "text", "text": user_text},
+                {"type": "text", "text": "Caption this image."},
                 {"type": "image_url", "image_url": {"url": _image_to_data_url(image_path)}},
             ],
         },
@@ -196,7 +217,37 @@ def caption_image(image_path: Path, system_prompt: str, lookup: TagLookup,
         for tc in tool_calls:
             call_id, name, args = _normalize_tool_call(tc)
             if name == "submit_caption":
-                submitted = (args.get("caption") or "").strip()
+                candidate = (args.get("caption") or "").strip()
+                if lookups == 0:
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": json.dumps({
+                            "ok": False,
+                            "error": (
+                                "submit_caption rejected: you must call "
+                                "lookup_tags at least once before submitting. "
+                                "Enumerate every visual concept in the image "
+                                "and call lookup_tags with the full list, "
+                                "then call submit_caption."
+                            ),
+                        }),
+                    })
+                    continue
+                if not candidate:
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": json.dumps({
+                            "ok": False,
+                            "error": (
+                                "submit_caption rejected: caption was empty. "
+                                "Write the Anima prompt and resubmit."
+                            ),
+                        }),
+                    })
+                    continue
+                submitted = candidate
                 messages.append({
                     "role": "tool",
                     "tool_call_id": call_id,
@@ -226,8 +277,6 @@ def caption_image(image_path: Path, system_prompt: str, lookup: TagLookup,
             })
 
         if submitted is not None:
-            if not submitted:
-                raise RuntimeError("submit_caption was called with an empty caption.")
             return submitted, lookups
 
     raise RuntimeError("Exceeded max tool iterations without a final answer.")
@@ -263,7 +312,7 @@ def caption_all(
     if not todo:
         return 0, 0
 
-    system_prompt = Path(anima_md_path).read_text()
+    system_prompt = build_system_prompt(Path(anima_md_path).read_text())
     print(f"Loading tag-lookup model + opening {db_path} ...", flush=True)
     lookup = TagLookup(db_path, n_gpu_layers=n_gpu_layers)
 
